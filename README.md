@@ -2,20 +2,20 @@
 
 A checkers game with an AI opponent that learns to play through self-play, inspired by Arthur Samuel's 1959 checkers program — one of the earliest examples of machine learning.
 
+**[Play it here](https://raggedr.github.io/checkers/)**
+
 ## Quick Start
 
-```bash
-pip install flask
-python app.py
-```
+Just open `index.html` in a browser — no server or build step needed. The game runs entirely client-side.
 
-Open http://localhost:5050. You play black (first move). Click a piece, click a highlighted square, and the AI responds.
-
-To train a stronger AI from scratch:
+To train a stronger AI from scratch (requires Python, no external dependencies):
 
 ```bash
-python ai.py train 1000
+python ai.py              # default: 200 training games + 20-game evaluation match
+python ai.py train 500    # custom game count
 ```
+
+After training, copy the new weights from `weights.json` into the `WEIGHTS` array in `index.html`.
 
 ## How It Works
 
@@ -113,22 +113,13 @@ The draws in trained-vs-untrained come from color alternation — at depth 3, on
 ## Architecture
 
 ```
-checkers.py    284 lines   Game engine, board, moves, rules
-ai.py          385 lines   Features, evaluator, minimax, training
-app.py         113 lines   Flask API server
-index.html     437 lines   Board UI (inline JS/CSS)
-weights.json    26 lines   Learned weights
+index.html     896 lines   Complete game: engine, AI, and UI (all inline JS/CSS)
+checkers.py    284 lines   Python game engine (used by training only)
+ai.py          385 lines   Features, evaluator, minimax, TD(lambda) training
+weights.json    26 lines   Learned weights output from training
 ```
 
-## API
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/state` | GET | Current board state |
-| `/api/new_game` | POST | Reset the board |
-| `/api/legal_moves` | GET | Legal moves for current player |
-| `/api/make_move` | POST | Human moves, AI responds |
-| `/api/train` | POST | Run self-play training (blocking) |
+The game engine and AI were ported from Python to JS so everything runs client-side with no server or build step. The Flask version is preserved at git tag `flask-version`.
 
 ## References
 
