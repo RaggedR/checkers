@@ -211,21 +211,11 @@
     box-shadow: 0 2px 8px rgba(58,157,106,0.3);
   }
   #btn-new:hover { box-shadow: 0 4px 12px rgba(58,157,106,0.4); }
-  #btn-train {
-    background: linear-gradient(135deg, var(--accent-amber), #c47d4a);
-    color: #fff;
-    box-shadow: 0 2px 8px rgba(212,145,94,0.3);
-  }
-  #btn-train:hover { box-shadow: 0 4px 12px rgba(212,145,94,0.4); }
   button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
 
   .info {
     margin-top: 16px; text-align: center; font-size: 0.85em;
     color: var(--text-muted); max-width: 520px; line-height: 1.5;
-  }
-  .weights-display {
-    margin-top: 12px; font-size: 0.78em; color: #6a5a4a;
-    max-width: 520px; text-align: center;
   }
 
   .spinner {
@@ -283,36 +273,394 @@
 
 <div class="controls">
   <button id="btn-new" onclick="newGame()">New Game</button>
-  <button id="btn-train" onclick="trainAI()">Train AI (500 games)</button>
 </div>
 
 <div class="info">
-  Drag a piece or click-then-click. Captures are mandatory. Train to make the AI stronger!
+  Drag a piece or click-then-click. Captures are mandatory.
 </div>
-<div class="weights-display" id="weights-info"></div>
 
 <script>
+// ═══════════════════════════════════════════════════════════════════
+// GAME ENGINE — ported from checkers.py
+// Board: 32 dark squares. Pieces: 1=black man, 2=black king,
+//        -1=white man, -2=white king, 0=empty.
+// Black moves DOWN (toward row 7), white moves UP (toward row 0).
+// ═══════════════════════════════════════════════════════════════════
+
+// Square ↔ (row, col) mappings
+const SQ_TO_RC = new Array(32);
+const RC_TO_SQ = {};
+for (let sq = 0; sq < 32; sq++) {
+  const r = sq >> 2;
+  const c = 2 * (sq & 3) + (r % 2 === 0 ? 1 : 0);
+  SQ_TO_RC[sq] = [r, c];
+  RC_TO_SQ[r * 8 + c] = sq;
+}
+
+// Precomputed adjacency tables
+// ADJACENT[sq] = [[dr, dc, neighborSq], ...]
+// JUMPS[sq]    = [[dr, dc, overSq, landSq], ...]
+const ADJACENT = Array.from({length: 32}, () => []);
+const JUMPS    = Array.from({length: 32}, () => []);
+const DIRS = [[-1,-1], [-1,1], [1,-1], [1,1]];
+
+for (let sq = 0; sq < 32; sq++) {
+  const [r, c] = SQ_TO_RC[sq];
+  for (const [dr, dc] of DIRS) {
+    const nr = r + dr, nc = c + dc;
+    if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+      const nsq = RC_TO_SQ[nr * 8 + nc];
+      if (nsq !== undefined) {
+        ADJACENT[sq].push([dr, dc, nsq]);
+      }
+    }
+    const jr = r + 2*dr, jc = c + 2*dc;
+    if (jr >= 0 && jr < 8 && jc >= 0 && jc < 8) {
+      const over = RC_TO_SQ[nr * 8 + nc];
+      const land = RC_TO_SQ[jr * 8 + jc];
+      if (over !== undefined && land !== undefined) {
+        JUMPS[sq].push([dr, dc, over, land]);
+      }
+    }
+  }
+}
+
+const BLACK_KING_ROW = 7;
+const WHITE_KING_ROW = 0;
+const DRAW_HALF_MOVES = 80;
+
+// Center squares (rows 2-5, cols 2-5)
+const CENTER_SQUARES = new Set();
+for (let sq = 0; sq < 32; sq++) {
+  const [r, c] = SQ_TO_RC[sq];
+  if (r >= 2 && r <= 5 && c >= 2 && c <= 5) CENTER_SQUARES.add(sq);
+}
+
+// Back row squares
+const BLACK_BACK_ROW = new Set();
+const WHITE_BACK_ROW = new Set();
+for (let sq = 0; sq < 32; sq++) {
+  if (SQ_TO_RC[sq][0] === 0) BLACK_BACK_ROW.add(sq);
+  if (SQ_TO_RC[sq][0] === 7) WHITE_BACK_ROW.add(sq);
+}
+
+class CheckersGame {
+  constructor() {
+    this.board = new Array(32).fill(0);
+    for (let sq = 0; sq < 12; sq++)  this.board[sq] = 1;   // black men
+    for (let sq = 20; sq < 32; sq++) this.board[sq] = -1;  // white men
+    this.turn = 1;
+    this.halfMovesSinceCapture = 0;
+    this.moveHistory = [];
+  }
+
+  copy() {
+    const g = new CheckersGame();
+    g.board = this.board.slice();
+    g.turn = this.turn;
+    g.halfMovesSinceCapture = this.halfMovesSinceCapture;
+    g.moveHistory = this.moveHistory.slice();
+    return g;
+  }
+
+  _forwardDirs(color) {
+    return color === 1 ? [1] : [-1];
+  }
+
+  _getSimpleMoves() {
+    const moves = [];
+    for (let sq = 0; sq < 32; sq++) {
+      const piece = this.board[sq];
+      if (piece === 0 || (piece > 0) !== (this.turn > 0)) continue;
+      const isKing = Math.abs(piece) === 2;
+      const allowedDr = isKing ? [-1, 1] : this._forwardDirs(this.turn);
+      for (const [dr, dc, nsq] of ADJACENT[sq]) {
+        if (!allowedDr.includes(dr)) continue;
+        if (this.board[nsq] === 0) moves.push([sq, nsq]);
+      }
+    }
+    return moves;
+  }
+
+  _getJumpSequences() {
+    const allJumps = [];
+    for (let sq = 0; sq < 32; sq++) {
+      const piece = this.board[sq];
+      if (piece === 0 || (piece > 0) !== (this.turn > 0)) continue;
+      this._dfsJumps(sq, piece, this.board.slice(), [sq], new Set(), allJumps);
+    }
+    return allJumps;
+  }
+
+  _dfsJumps(sq, piece, board, path, captured, allJumps) {
+    const isKing = Math.abs(piece) === 2;
+    const allowedDr = isKing ? [-1, 1] : this._forwardDirs(this.turn);
+    let foundJump = false;
+
+    for (const [dr, dc, over, land] of JUMPS[sq]) {
+      if (!allowedDr.includes(dr)) continue;
+      if (captured.has(over)) continue;
+      const overPiece = board[over];
+      if (overPiece === 0 || (overPiece > 0) === (this.turn > 0)) continue;
+      if (board[land] !== 0) continue;
+
+      const landRow = SQ_TO_RC[land][0];
+      let promotes = false;
+      if (Math.abs(piece) === 1) {
+        if (this.turn === 1 && landRow === BLACK_KING_ROW) promotes = true;
+        else if (this.turn === -1 && landRow === WHITE_KING_ROW) promotes = true;
+      }
+
+      foundJump = true;
+      board[sq] = 0;
+      board[land] = piece;
+      board[over] = 0;
+      captured.add(over);
+      path.push(land);
+
+      if (promotes) {
+        allJumps.push(path.slice());
+      } else {
+        this._dfsJumps(land, piece, board, path, captured, allJumps);
+      }
+
+      path.pop();
+      captured.delete(over);
+      board[sq] = piece;
+      board[land] = 0;
+      board[over] = overPiece;
+    }
+
+    if (!foundJump && path.length > 1) {
+      allJumps.push(path.slice());
+    }
+  }
+
+  getLegalMoves() {
+    const jumps = this._getJumpSequences();
+    if (jumps.length > 0) return jumps;
+    return this._getSimpleMoves();
+  }
+
+  makeMove(move) {
+    if (move.length < 2) throw new Error('Move must have at least 2 squares');
+    const start = move[0];
+    const piece = this.board[start];
+    let isCapture = false;
+
+    for (let i = 0; i < move.length - 1; i++) {
+      const fr = move[i], to = move[i + 1];
+      this.board[fr] = 0;
+      const [frR, frC] = SQ_TO_RC[fr];
+      const [toR, toC] = SQ_TO_RC[to];
+      if (Math.abs(toR - frR) === 2) {
+        const midR = (frR + toR) >> 1, midC = (frC + toC) >> 1;
+        const midSq = RC_TO_SQ[midR * 8 + midC];
+        this.board[midSq] = 0;
+        isCapture = true;
+      }
+      this.board[to] = piece;
+    }
+
+    const end = move[move.length - 1];
+    const endRow = SQ_TO_RC[end][0];
+    if (piece === 1 && endRow === BLACK_KING_ROW) this.board[end] = 2;
+    else if (piece === -1 && endRow === WHITE_KING_ROW) this.board[end] = -2;
+
+    this.halfMovesSinceCapture = isCapture ? 0 : this.halfMovesSinceCapture + 1;
+    this.moveHistory.push(move);
+    this.turn *= -1;
+    return this;
+  }
+
+  isGameOver() {
+    if (this.halfMovesSinceCapture >= DRAW_HALF_MOVES) return [true, 0];
+    if (this.getLegalMoves().length === 0) return [true, -this.turn];
+    return [false, null];
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// AI — ported from ai.py (play-time only, no training)
+// Linear evaluation + minimax with alpha-beta pruning
+// ═══════════════════════════════════════════════════════════════════
+
+const FEATURE_SCALE = [12, 12, 4, 4, 4, 40, 15, 15, 12, 12];
+const NUM_FEATURES = 10;
+const SEARCH_WIN = 1000;
+
+// Learned weights from TD(lambda) training
+const WEIGHTS = [1.1544761594405142, 1.5880812223046612, 0.7788488710587858, 0.26524196112909537, 0.35415330505482767, 0.13186108453283604, 0.22001476161834685, -0.22481708881478424, 0.21633042898278795, 0.1689346715382395];
+
+function extractFeatures(game) {
+  const board = game.board;
+  const feats = new Array(NUM_FEATURES).fill(0);
+
+  for (let sq = 0; sq < 32; sq++) {
+    const piece = board[sq];
+    if (piece === 0) continue;
+    const r = SQ_TO_RC[sq][0];
+
+    if (piece === 1) {       // black man
+      feats[0] += 1;
+      if (CENTER_SQUARES.has(sq)) feats[3] += 1;
+      if (BLACK_BACK_ROW.has(sq)) feats[2] += 1;
+      feats[5] += r;
+    } else if (piece === 2) { // black king
+      feats[1] += 1;
+      if (CENTER_SQUARES.has(sq)) feats[4] += 1;
+    } else if (piece === -1) { // white man
+      feats[0] -= 1;
+      if (CENTER_SQUARES.has(sq)) feats[3] -= 1;
+      if (WHITE_BACK_ROW.has(sq)) feats[2] -= 1;
+      feats[5] -= (7 - r);
+    } else if (piece === -2) { // white king
+      feats[1] -= 1;
+      if (CENTER_SQUARES.has(sq)) feats[4] -= 1;
+    }
+  }
+
+  // Mobility
+  const currentMoves = game.getLegalMoves().length;
+  game.turn *= -1;
+  const oppMoves = game.getLegalMoves().length;
+  game.turn *= -1;
+
+  if (game.turn === 1) {
+    feats[6] = currentMoves;
+    feats[7] = -oppMoves;
+  } else {
+    feats[6] = oppMoves;
+    feats[7] = -currentMoves;
+  }
+
+  // Vulnerable and protected pieces
+  for (let sq = 0; sq < 32; sq++) {
+    const piece = board[sq];
+    if (piece === 0) continue;
+    const isBlack = piece > 0;
+    const sign = isBlack ? 1 : -1;
+
+    let vulnerable = false;
+    let hasFriendly = false;
+    for (const [dr, dc, nsq] of ADJACENT[sq]) {
+      const neighbor = board[nsq];
+      if (neighbor === 0) continue;
+      const neighborIsBlack = neighbor > 0;
+      if (neighborIsBlack === isBlack) {
+        hasFriendly = true;
+      } else {
+        const landR = SQ_TO_RC[sq][0] + (SQ_TO_RC[sq][0] - SQ_TO_RC[nsq][0]);
+        const landC = SQ_TO_RC[sq][1] + (SQ_TO_RC[sq][1] - SQ_TO_RC[nsq][1]);
+        if (landR >= 0 && landR < 8 && landC >= 0 && landC < 8) {
+          const landSq = RC_TO_SQ[landR * 8 + landC];
+          if (landSq !== undefined && board[landSq] === 0) {
+            vulnerable = true;
+          }
+        }
+      }
+    }
+
+    if (vulnerable) feats[8] -= sign;
+    if (hasFriendly) feats[9] += sign;
+  }
+
+  // Normalize
+  for (let i = 0; i < NUM_FEATURES; i++) {
+    feats[i] /= FEATURE_SCALE[i];
+  }
+
+  return feats;
+}
+
+function evaluate(game) {
+  const [over, result] = game.isGameOver();
+  if (over) {
+    if (result === 1) return SEARCH_WIN;
+    if (result === -1) return -SEARCH_WIN;
+    return 0;
+  }
+  const feats = extractFeatures(game);
+  let score = 0;
+  for (let i = 0; i < NUM_FEATURES; i++) score += WEIGHTS[i] * feats[i];
+  return score;
+}
+
+function minimax(game, depth, alpha, beta, maximizing) {
+  const [over, result] = game.isGameOver();
+  if (over) {
+    if (result === 1) return [SEARCH_WIN, null];
+    if (result === -1) return [-SEARCH_WIN, null];
+    return [0, null];
+  }
+  if (depth === 0) return [evaluate(game), null];
+
+  const moves = game.getLegalMoves();
+  // Move ordering: longer moves (multi-jumps) first for better pruning
+  moves.sort((a, b) => b.length - a.length);
+
+  let bestMove = moves[0];
+
+  if (maximizing) {
+    let maxEval = -Infinity;
+    for (const move of moves) {
+      const child = game.copy();
+      child.makeMove(move);
+      const [score] = minimax(child, depth - 1, alpha, beta, false);
+      if (score > maxEval) {
+        maxEval = score;
+        bestMove = move;
+      }
+      alpha = Math.max(alpha, score);
+      if (beta <= alpha) break;
+    }
+    return [maxEval, bestMove];
+  } else {
+    let minEval = Infinity;
+    for (const move of moves) {
+      const child = game.copy();
+      child.makeMove(move);
+      const [score] = minimax(child, depth - 1, alpha, beta, true);
+      if (score < minEval) {
+        minEval = score;
+        bestMove = move;
+      }
+      beta = Math.min(beta, score);
+      if (beta <= alpha) break;
+    }
+    return [minEval, bestMove];
+  }
+}
+
+function chooseMove(game, depth = 5) {
+  const maximizing = game.turn === 1;
+  const [, move] = minimax(game, depth, -Infinity, Infinity, maximizing);
+  return move;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// FRONTEND — click/drag UI, renders board, orchestrates turns
+// ═══════════════════════════════════════════════════════════════════
+
 const PC = { 1:'bm', 2:'bk', '-1':'wm', '-2':'wk' };
 const AI_DELAY = 600;
 
-// Square mapping
-const sq2rc = {}, rc2sq = {};
-for (let s = 0; s < 32; s++) {
-  const r = s >> 2, c = 2 * (s & 3) + (r % 2 === 0 ? 1 : 0);
-  sq2rc[s] = [r, c];
-  rc2sq[r * 8 + c] = s;
-}
+// UI square mapping (same as SQ_TO_RC / RC_TO_SQ but keyed for the render loop)
+const sq2rc = SQ_TO_RC;
+const rc2sq = RC_TO_SQ;
 
-let board = new Array(32).fill(0);
+let game = new CheckersGame();
 let movesBySrc = {};
 let selected = null;
 let gameOver = false;
 let lastAI = null;
 let busy = false;
 
-// ── Drag state (mouse-based) ──
-let dragging = null;   // square index being dragged
-let dragDests = null;   // Set of valid destination squares
+// ── Drag state ──
+let dragging = null;
+let dragDests = null;
 const ghost = () => document.getElementById('ghost');
 
 function destsFor(sq) {
@@ -320,18 +668,10 @@ function destsFor(sq) {
   return new Set(movesBySrc[sq].map(m => m[m.length - 1]));
 }
 
-// ── Fetch helpers ──
-
-async function loadState() {
-  const r = await fetch('/api/state');
-  return r.json();
-}
-
-async function loadMoves() {
-  const r = await fetch('/api/legal_moves');
-  const d = await r.json();
+function loadMoves() {
   movesBySrc = {};
-  for (const m of d.moves) {
+  const moves = game.getLegalMoves();
+  for (const m of moves) {
     const s = m[0];
     (movesBySrc[s] ??= []).push(m);
   }
@@ -365,7 +705,7 @@ function render() {
       if (dests.has(sq)) div.classList.add('highlight');
       if (aiSet.has(sq)) div.classList.add('last-move');
 
-      const p = board[sq];
+      const p = game.board[sq];
       if (p !== 0) {
         const pd = document.createElement('div');
         pd.className = 'pc ' + PC[p];
@@ -374,7 +714,6 @@ function render() {
           cr.className = 'crown'; cr.textContent = '\u265B';
           pd.appendChild(cr);
         }
-        // Mark as draggable if it's the player's movable piece
         const canMove = p > 0 && !busy && !gameOver && movesBySrc[sq];
         if (canMove) pd.classList.add('can-move');
         if (sq === dragging) pd.classList.add('ghost-src');
@@ -390,8 +729,6 @@ function render() {
 
 document.addEventListener('mousedown', (e) => {
   if (busy || gameOver) return;
-
-  // Find if we clicked on a piece inside a square
   const pcEl = e.target.closest('.pc.can-move');
   if (!pcEl) return;
   const sqEl = pcEl.closest('.sq');
@@ -405,9 +742,8 @@ document.addEventListener('mousedown', (e) => {
   selected = null;
   dragDests = destsFor(sq);
 
-  // Set up ghost
   const g = ghost();
-  g.className = 'pc ' + PC[board[sq]];
+  g.className = 'pc ' + PC[game.board[sq]];
   g.style.display = 'block';
   g.style.position = 'fixed';
   g.style.pointerEvents = 'none';
@@ -420,7 +756,7 @@ document.addEventListener('mousedown', (e) => {
   g.style.left = e.clientX + 'px';
   g.style.top = e.clientY + 'px';
   g.innerHTML = '';
-  if (Math.abs(board[sq]) === 2) {
+  if (Math.abs(game.board[sq]) === 2) {
     const cr = document.createElement('span');
     cr.className = 'crown'; cr.textContent = '\u265B';
     g.appendChild(cr);
@@ -435,7 +771,6 @@ document.addEventListener('mousemove', (e) => {
   g.style.left = e.clientX + 'px';
   g.style.top = e.clientY + 'px';
 
-  // Highlight square under cursor
   document.querySelectorAll('.sq.drop-over').forEach(el => el.classList.remove('drop-over'));
   const under = document.elementFromPoint(e.clientX, e.clientY);
   if (under) {
@@ -453,7 +788,6 @@ document.addEventListener('mouseup', (e) => {
   ghost().style.display = 'none';
   document.querySelectorAll('.sq.drop-over').forEach(el => el.classList.remove('drop-over'));
 
-  // Check if we dropped on a valid destination
   const under = document.elementFromPoint(e.clientX, e.clientY);
   let targetSq = null;
   if (under) {
@@ -468,7 +802,6 @@ document.addEventListener('mouseup', (e) => {
     if (move) { submitMove(move); return; }
   }
 
-  // Cancelled drag — treat as click-select instead
   const sq = dragging;
   dragging = null;
   dragDests = null;
@@ -476,24 +809,20 @@ document.addEventListener('mouseup', (e) => {
   render();
 });
 
-// ── Click to move (on squares) ──
+// ── Click to move ──
 
 document.getElementById('board').addEventListener('click', (e) => {
   if (busy || gameOver || dragging !== null) return;
-
   const sqEl = e.target.closest('.sq');
   if (!sqEl) return;
   const sq = parseInt(sqEl.dataset.sq);
+  const p = game.board[sq];
 
-  const p = board[sq];
-
-  // Clicking a highlighted destination
   if (selected !== null && movesBySrc[selected]) {
     const move = movesBySrc[selected].find(m => m[m.length - 1] === sq);
     if (move) { submitMove(move); return; }
   }
 
-  // Clicking own piece
   if (p > 0 && movesBySrc[sq]) {
     selected = sq;
     render();
@@ -506,86 +835,62 @@ document.getElementById('board').addEventListener('click', (e) => {
 
 // ── Move submission ──
 
-async function submitMove(move) {
+function submitMove(move) {
   busy = true;
   selected = null;
 
-  const res = await fetch('/api/make_move', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ move })
-  });
-  const st = await res.json();
-  if (st.error) { setStatus('Error: ' + st.error); busy = false; return; }
-
-  board = st.board;
-  gameOver = st.is_over;
+  game.makeMove(move);
   lastAI = null;
   render();
 
-  if (gameOver) {
-    setStatus(st.result === 1 ? 'You win!' : st.result === -1 ? 'AI wins!' : 'Draw!');
+  const [over1, result1] = game.isGameOver();
+  if (over1) {
+    gameOver = true;
+    setStatus(result1 === 1 ? 'You win!' : result1 === -1 ? 'AI wins!' : 'Draw!');
     busy = false;
+    render();
     return;
   }
 
   setStatus('<span class="spinner"></span>AI is thinking...');
-  await new Promise(r => setTimeout(r, AI_DELAY));
 
-  const ar = await fetch('/api/ai_move', { method: 'POST' });
-  const ad = await ar.json();
-  board = ad.state.board;
-  gameOver = ad.state.is_over;
-  lastAI = ad.ai_move;
+  // Use setTimeout to let the UI update before the AI blocks the thread
+  setTimeout(() => {
+    const aiMove = chooseMove(game, 5);
+    if (aiMove) {
+      game.makeMove(aiMove);
+      lastAI = aiMove;
+    }
 
-  if (gameOver) {
-    setStatus(ad.state.result === 1 ? 'You win!' : ad.state.result === -1 ? 'AI wins!' : 'Draw!');
-  } else {
-    setStatus('Your turn');
-    await loadMoves();
-  }
+    const [over2, result2] = game.isGameOver();
+    if (over2) {
+      gameOver = true;
+      setStatus(result2 === 1 ? 'You win!' : result2 === -1 ? 'AI wins!' : 'Draw!');
+    } else {
+      setStatus('Your turn');
+      loadMoves();
+    }
+    busy = false;
+    render();
+  }, AI_DELAY);
+}
+
+// ── New game ──
+
+function newGame() {
+  game = new CheckersGame();
+  gameOver = false;
+  selected = null;
+  lastAI = null;
   busy = false;
-  render();
-}
-
-// ── New game / training ──
-
-async function newGame() {
-  await fetch('/api/new_game', { method: 'POST' });
-  const st = await loadState();
-  board = st.board; gameOver = st.is_over;
-  selected = null; lastAI = null; busy = false;
   setStatus('Your turn');
-  await loadMoves();
+  loadMoves();
   render();
-}
-
-async function trainAI() {
-  document.getElementById('btn-train').disabled = true;
-  setStatus('<span class="spinner"></span>Training (500 games)...');
-  try {
-    const r = await fetch('/api/train', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ num_games: 500, depth: 3 })
-    });
-    const d = await r.json();
-    const s = d.stats;
-    setStatus(`Done! B:${s.black_wins} W:${s.white_wins} D:${s.draws} — start a new game`);
-    const pairs = Object.entries(d.weights).map(([k,v]) => `${k}: ${v}`);
-    document.getElementById('weights-info').textContent = pairs.join(' | ');
-  } catch (e) { setStatus('Error: ' + e.message); }
-  document.getElementById('btn-train').disabled = false;
 }
 
 // ── Init ──
-(async () => {
-  const st = await loadState();
-  board = st.board; gameOver = st.is_over;
-  setStatus(st.turn === 1 ? 'Your turn' : 'AI thinking...');
-  await loadMoves();
-  render();
-})();
+loadMoves();
+render();
 </script>
 </body>
 </html>
